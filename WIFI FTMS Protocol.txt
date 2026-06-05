@@ -1,0 +1,825 @@
+// Program.cs
+//
+// .NET 10 WinForms FTMS WiFi Client
+//
+// FIXES INCLUDED:
+// - Correct Hyperborea TNP framing
+// - Proper FTMS notification subscription
+// - Proper FTMS control-point writes
+// - Adds REQUIRED "Request Control" command
+// - Removes unnecessary Start/Resume
+// - Correct FTMS treadmill telemetry decoding
+// - Working speed + incline writes
+//
+// TargetFramework:
+// <TargetFramework>net10.0-windows</TargetFramework>
+// <UseWindowsForms>true</UseWindowsForms>
+
+using System;
+using System.Buffers.Binary;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace FtmsWifiClient
+{
+    internal static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            ApplicationConfiguration.Initialize();
+            Application.Run(new MainForm());
+        }
+    }
+
+    public class MainForm : Form
+    {
+        // ============================================================
+        // TNP / FTMS CONSTANTS
+        // ============================================================
+
+        private const int Port = 36866;
+
+        private const byte TnpVersion = 0x01;
+
+        private const byte ID_WRITE_CHARACTERISTIC = 0x04;
+        private const byte ID_ENABLE_NOTIFICATIONS = 0x05;
+        private const byte ID_NOTIFICATION = 0x06;
+
+        // ============================================================
+        // FTMS UUIDS
+        // ============================================================
+
+        private static readonly byte[] TreadmillDataUuid =
+        {
+            0x00, 0x00, 0x2A, 0xCD,
+            0x00, 0x00,
+            0x10, 0x00,
+            0x80, 0x00,
+            0x00, 0x80,
+            0x5F, 0x9B, 0x34, 0xFB
+        };
+
+        private static readonly byte[] ControlPointUuid =
+        {
+            0x00, 0x00, 0x2A, 0xD9,
+            0x00, 0x00,
+            0x10, 0x00,
+            0x80, 0x00,
+            0x00, 0x80,
+            0x5F, 0x9B, 0x34, 0xFB
+        };
+
+        // ============================================================
+        // UI
+        // ============================================================
+
+        private readonly TextBox txtIp = new();
+        private readonly TextBox txtSpeed = new();
+        private readonly TextBox txtIncline = new();
+
+        private readonly Label lblActualSpeed = new();
+        private readonly Label lblActualIncline = new();
+        private readonly Label lblDistance = new();
+        private readonly Label lblStatus = new();
+
+        private readonly Button btnConnect = new();
+        private readonly Button btnSend = new();
+
+        // ============================================================
+        // NETWORK
+        // ============================================================
+
+        private TcpClient? _client;
+        private NetworkStream? _stream;
+        private CancellationTokenSource? _cts;
+
+        private byte _sequence = 1;
+
+        // ============================================================
+        // CONSTRUCTOR
+        // ============================================================
+
+        public MainForm()
+        {
+            Text = "FTMS WiFi Client";
+            Width = 650;
+            Height = 430;
+            StartPosition = FormStartPosition.CenterScreen;
+
+            BuildUi();
+
+            FormClosing += (_, _) => Disconnect();
+
+            // Auto-discover treadmill when form appears
+            Shown += async (_, _) =>
+            {
+                try
+                {
+                    lblStatus.Text = "Scanning network...";
+                    lblStatus.ForeColor = Color.DarkOrange;
+
+                    string? ip =
+                        await DiscoverTreadmillAsync();
+
+                    if (ip != null)
+                    {
+                        txtIp.Text = ip;
+
+                        lblStatus.Text =
+                            $"Found treadmill: {ip}";
+
+                        lblStatus.ForeColor =
+                            Color.DarkGreen;
+
+                        Console.WriteLine(
+                            $"Auto-detected treadmill at {ip}");
+                    }
+                    else
+                    {
+                        lblStatus.Text =
+                            "No treadmill found";
+
+                        lblStatus.ForeColor =
+                            Color.DarkRed;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(ex);
+
+                    lblStatus.Text =
+                        "Discovery failed";
+
+                    lblStatus.ForeColor =
+                        Color.DarkRed;
+                }
+            };
+        }
+
+        // ============================================================
+        // UI
+        // ============================================================
+
+        private void BuildUi()
+        {
+            Controls.Add(new Label
+            {
+                Text = "Treadmill IP:",
+                Left = 20,
+                Top = 20,
+                Width = 120
+            });
+
+            txtIp.Left = 160;
+            txtIp.Top = 18;
+            txtIp.Width = 260;
+            txtIp.Text = "192.168.1.100";
+            Controls.Add(txtIp);
+
+            btnConnect.Text = "Connect";
+            btnConnect.Left = 450;
+            btnConnect.Top = 16;
+            btnConnect.Width = 140;
+            btnConnect.Height = 32;
+            btnConnect.Click += BtnConnect_Click;
+            Controls.Add(btnConnect);
+
+            Controls.Add(new Label
+            {
+                Text = "Target Speed (km/h):",
+                Left = 20,
+                Top = 90,
+                Width = 180
+            });
+
+            txtSpeed.Left = 220;
+            txtSpeed.Top = 88;
+            txtSpeed.Width = 120;
+            txtSpeed.Text = "5.0";
+            Controls.Add(txtSpeed);
+
+            Controls.Add(new Label
+            {
+                Text = "Target Incline (%):",
+                Left = 20,
+                Top = 130,
+                Width = 180
+            });
+
+            txtIncline.Left = 220;
+            txtIncline.Top = 128;
+            txtIncline.Width = 120;
+            txtIncline.Text = "1.0";
+            Controls.Add(txtIncline);
+
+            btnSend.Text = "Send Speed + Incline";
+            btnSend.Left = 220;
+            btnSend.Top = 180;
+            btnSend.Width = 230;
+            btnSend.Height = 45;
+            btnSend.Enabled = false;
+            btnSend.Click += BtnSend_Click;
+            Controls.Add(btnSend);
+
+            lblActualSpeed.Text = "Actual Speed: --";
+            lblActualSpeed.Left = 20;
+            lblActualSpeed.Top = 270;
+            lblActualSpeed.Width = 450;
+            lblActualSpeed.Font = new Font(Font.FontFamily, 11, FontStyle.Bold);
+            Controls.Add(lblActualSpeed);
+
+            lblActualIncline.Text = "Actual Incline: --";
+            lblActualIncline.Left = 20;
+            lblActualIncline.Top = 305;
+            lblActualIncline.Width = 450;
+            lblActualIncline.Font = new Font(Font.FontFamily, 11, FontStyle.Bold);
+            Controls.Add(lblActualIncline);
+
+            lblDistance.Text = "Distance: --";
+            lblDistance.Left = 20;
+            lblDistance.Top = 340;
+            lblDistance.Width = 450;
+            lblDistance.Font = new Font(Font.FontFamily, 11, FontStyle.Bold);
+            Controls.Add(lblDistance);
+
+            lblStatus.Text = "Disconnected";
+            lblStatus.Left = 470;
+            lblStatus.Top = 340;
+            lblStatus.Width = 150;
+            lblStatus.ForeColor = Color.DarkRed;
+            lblStatus.Font = new Font(Font.FontFamily, 10, FontStyle.Bold);
+            Controls.Add(lblStatus);
+        }
+
+        // Detect IP Address
+
+        private async Task<string?> DiscoverTreadmillAsync()
+        {
+            string subnet = GetLocalSubnet();
+
+            if (string.IsNullOrWhiteSpace(subnet))
+                return null;
+
+            using CancellationTokenSource cts =
+                new(TimeSpan.FromSeconds(5));
+
+            var tasks = new List<Task<string?>>();
+
+            for (int i = 1; i <= 254; i++)
+            {
+                string ip = $"{subnet}.{i}";
+
+                tasks.Add(CheckHostAsync(ip, cts.Token));
+            }
+
+            while (tasks.Count > 0)
+            {
+                Task<string?> finished =
+                    await Task.WhenAny(tasks);
+
+                tasks.Remove(finished);
+
+                string? result = await finished;
+
+                if (result != null)
+                {
+                    cts.Cancel();
+                    return result;
+                }
+            }
+
+            return null;
+        }
+
+        private async Task<string?> CheckHostAsync(
+    string ip,
+    CancellationToken token)
+        {
+            try
+            {
+                using TcpClient client = new();
+
+                var connectTask =
+                    client.ConnectAsync(ip, 36866);
+
+                var timeoutTask =
+                    Task.Delay(500, token);
+
+                var completed =
+                    await Task.WhenAny(connectTask, timeoutTask);
+
+                if (completed != connectTask)
+                    return null;
+
+                if (!client.Connected)
+                    return null;
+
+                Console.WriteLine($"FOUND PORT 36866: {ip}");
+
+                using NetworkStream stream =
+                    client.GetStream();
+
+                // Optional:
+                // verify TNP by sending EnableNotifications
+
+                return ip;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string GetLocalSubnet()
+        {
+            foreach (var ip in
+                System.Net.Dns.GetHostAddresses(
+                    System.Net.Dns.GetHostName()))
+            {
+                if (ip.AddressFamily ==
+                    System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    string[] parts =
+                        ip.ToString().Split('.');
+
+                    if (parts.Length == 4)
+                    {
+                        return $"{parts[0]}.{parts[1]}.{parts[2]}";
+                    }
+                }
+            }
+
+            return "";
+        }
+
+        // ============================================================
+        // CONNECT
+        // ============================================================
+
+        private async void BtnConnect_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                Disconnect();
+
+                _cts = new CancellationTokenSource();
+
+                _client = new TcpClient
+                {
+                    NoDelay = true
+                };
+
+                await _client.ConnectAsync(txtIp.Text.Trim(), Port);
+
+                _stream = _client.GetStream();
+
+                lblStatus.Text = "Connected";
+                lblStatus.ForeColor = Color.DarkGreen;
+
+                Console.WriteLine("CONNECTED");
+
+                _ = Task.Run(() => ReceiveLoop(_cts.Token));
+
+                // Enable notifications
+                await EnableNotifications(_cts.Token);
+
+                await Task.Delay(300);
+
+                // REQUIRED FOR SPEED CONTROL
+                await RequestControl(_cts.Token);
+
+                await Task.Delay(300);
+
+                btnSend.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Connection failed:\n\n{ex}");
+                Disconnect();
+            }
+        }
+
+        // ============================================================
+        // ENABLE NOTIFICATIONS
+        // ============================================================
+
+        private async Task EnableNotifications(CancellationToken token)
+        {
+            byte[] payload = new byte[17];
+
+            Buffer.BlockCopy(
+                TreadmillDataUuid,
+                0,
+                payload,
+                0,
+                16);
+
+            payload[16] = 0x01;
+
+            await SendTnpPacket(
+                ID_ENABLE_NOTIFICATIONS,
+                payload,
+                token);
+
+            Console.WriteLine("TX ENABLE NOTIFICATIONS");
+        }
+
+        // ============================================================
+        // REQUEST CONTROL
+        // ============================================================
+
+        private async Task RequestControl(CancellationToken token)
+        {
+            byte[] ftms = new byte[]
+            {
+                0x00
+            };
+
+            await WriteControlPoint(ftms, token);
+
+            Console.WriteLine("TX REQUEST CONTROL");
+        }
+
+        // ============================================================
+        // SEND BUTTON
+        // ============================================================
+
+        private async void BtnSend_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (_cts == null)
+                    return;
+
+                if (!float.TryParse(
+                        txtSpeed.Text,
+                        NumberStyles.Float,
+                        CultureInfo.InvariantCulture,
+                        out float speed))
+                    return;
+
+                if (!float.TryParse(
+                        txtIncline.Text,
+                        NumberStyles.Float,
+                        CultureInfo.InvariantCulture,
+                        out float incline))
+                    return;
+
+                // SPEED FIRST
+                await SendSpeedCommand(speed, _cts.Token);
+
+                await Task.Delay(100);
+
+                // THEN INCLINE
+                await SendInclineCommand(incline, _cts.Token);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Send failed:\n\n{ex}");
+            }
+        }
+
+        // ============================================================
+        // SPEED COMMAND
+        // ============================================================
+
+        private async Task SendSpeedCommand(
+            float speedKmh,
+            CancellationToken token)
+        {
+            ushort rawSpeed = (ushort)(speedKmh * 100);
+
+            byte[] ftms = new byte[]
+            {
+                0x02,
+                (byte)(rawSpeed & 0xFF),
+                (byte)((rawSpeed >> 8) & 0xFF)
+            };
+
+            await WriteControlPoint(ftms, token);
+
+            Console.WriteLine(
+                $"TX SPEED {speedKmh:F2} ({rawSpeed})");
+        }
+
+        // ============================================================
+        // INCLINE COMMAND
+        // ============================================================
+
+        private async Task SendInclineCommand(
+            float inclinePercent,
+            CancellationToken token)
+        {
+            short rawIncline = (short)(inclinePercent * 10);
+
+            byte[] ftms = new byte[]
+            {
+                0x03,
+                (byte)(rawIncline & 0xFF),
+                (byte)((rawIncline >> 8) & 0xFF)
+            };
+
+            await WriteControlPoint(ftms, token);
+
+            Console.WriteLine(
+                $"TX INCLINE {inclinePercent:F1}");
+        }
+
+        // ============================================================
+        // CONTROL POINT WRITE
+        // ============================================================
+
+        private async Task WriteControlPoint(
+            byte[] ftmsPayload,
+            CancellationToken token)
+        {
+            byte[] payload = new byte[16 + ftmsPayload.Length];
+
+            Buffer.BlockCopy(
+                ControlPointUuid,
+                0,
+                payload,
+                0,
+                16);
+
+            Buffer.BlockCopy(
+                ftmsPayload,
+                0,
+                payload,
+                16,
+                ftmsPayload.Length);
+
+            await SendTnpPacket(
+                ID_WRITE_CHARACTERISTIC,
+                payload,
+                token);
+        }
+
+        // ============================================================
+        // TNP SEND
+        // ============================================================
+
+        private async Task SendTnpPacket(
+            byte identifier,
+            byte[] payload,
+            CancellationToken token)
+        {
+            if (_stream == null)
+                return;
+
+            byte[] header = new byte[6];
+
+            header[0] = TnpVersion;
+            header[1] = identifier;
+            header[2] = _sequence++;
+            header[3] = 0x00;
+
+            header[4] = (byte)(payload.Length >> 8);
+            header[5] = (byte)(payload.Length & 0xFF);
+
+            Console.WriteLine(
+                $"TX HEADER: {BitConverter.ToString(header)}");
+
+            Console.WriteLine(
+                $"TX PAYLOAD: {BitConverter.ToString(payload)}");
+
+            await _stream.WriteAsync(header, token);
+
+            await _stream.WriteAsync(payload, token);
+
+            await _stream.FlushAsync(token);
+        }
+
+        // ============================================================
+        // RECEIVE LOOP
+        // ============================================================
+
+        private async Task ReceiveLoop(CancellationToken token)
+        {
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    byte[] header = await ReadExactAsync(6, token);
+
+                    byte identifier = header[1];
+
+                    ushort payloadLength =
+                        BinaryPrimitives.ReadUInt16BigEndian(
+                            header.AsSpan(4, 2));
+
+                    byte[] payload = payloadLength > 0
+                        ? await ReadExactAsync(payloadLength, token)
+                        : Array.Empty<byte>();
+
+                    Console.WriteLine(
+                        $"RX ID={identifier:X2} LEN={payloadLength}");
+
+                    Console.WriteLine(
+                        $"RX PAYLOAD: {BitConverter.ToString(payload)}");
+
+                    if (identifier == ID_NOTIFICATION)
+                    {
+                        ProcessNotification(payload);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (IOException)
+            {
+                BeginInvoke(() => Disconnect());
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex);
+
+                BeginInvoke(() =>
+                {
+                    MessageBox.Show(ex.ToString());
+                    Disconnect();
+                });
+            }
+        }
+
+        // ============================================================
+        // PROCESS FTMS NOTIFICATION
+        // ============================================================
+
+        private void ProcessNotification(byte[] payload)
+        {
+            try
+            {
+                if (payload.Length < 16)
+                    return;
+
+                byte[] ftms = new byte[payload.Length - 16];
+
+                Buffer.BlockCopy(
+                    payload,
+                    16,
+                    ftms,
+                    0,
+                    ftms.Length);
+
+                Console.WriteLine(
+                    $"FTMS DATA: {BitConverter.ToString(ftms)}");
+
+                DecodeTreadmillData(ftms);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex);
+            }
+        }
+
+        // ============================================================
+        // DECODE FTMS TREADMILL DATA
+        // ============================================================
+
+        private void DecodeTreadmillData(byte[] data)
+        {
+            if (data.Length < 4)
+                return;
+
+            int offset = 0;
+
+            ushort flags =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    data.AsSpan(offset, 2));
+
+            offset += 2;
+
+            ushort speedRaw =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    data.AsSpan(offset, 2));
+
+            offset += 2;
+
+            float speed = speedRaw / 100f;
+
+            float incline = 0;
+            float distance = 0;
+
+            bool distancePresent =
+                (flags & (1 << 2)) != 0;
+
+            if (distancePresent &&
+                data.Length >= offset + 3)
+            {
+                int distanceRaw =
+                    data[offset]
+                    | (data[offset + 1] << 8)
+                    | (data[offset + 2] << 16);
+
+                distance = distanceRaw;
+
+                offset += 3;
+            }
+
+            bool inclinePresent =
+                (flags & (1 << 3)) != 0;
+
+            if (inclinePresent &&
+                data.Length >= offset + 4)
+            {
+                short inclineRaw =
+                    BinaryPrimitives.ReadInt16LittleEndian(
+                        data.AsSpan(offset, 2));
+
+                incline = inclineRaw / 10f;
+
+                offset += 4;
+            }
+
+            BeginInvoke(() =>
+            {
+                lblActualSpeed.Text =
+                    $"Actual Speed: {speed:F2} km/h";
+
+                lblActualIncline.Text =
+                    $"Actual Incline: {incline:F1}%";
+
+                lblDistance.Text =
+                    $"Distance: {distance:F0} m";
+            });
+        }
+
+        // ============================================================
+        // READ EXACT
+        // ============================================================
+
+        private async Task<byte[]> ReadExactAsync(
+            int count,
+            CancellationToken token)
+        {
+            if (_stream == null)
+                throw new InvalidOperationException();
+
+            byte[] buffer = new byte[count];
+
+            int offset = 0;
+
+            while (offset < count)
+            {
+                int read = await _stream.ReadAsync(
+                    buffer.AsMemory(offset, count - offset),
+                    token);
+
+                if (read == 0)
+                    throw new IOException("Socket closed");
+
+                offset += read;
+            }
+
+            return buffer;
+        }
+
+        // ============================================================
+        // DISCONNECT
+        // ============================================================
+
+        private void Disconnect()
+        {
+            try
+            {
+                _cts?.Cancel();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                _stream?.Dispose();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                _client?.Close();
+            }
+            catch
+            {
+            }
+
+            _stream = null;
+            _client = null;
+            _cts = null;
+
+            btnSend.Enabled = false;
+
+            lblStatus.Text = "Disconnected";
+            lblStatus.ForeColor = Color.DarkRed;
+        }
+    }
+}
